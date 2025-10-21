@@ -1,3 +1,17 @@
+// Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package xctx
 
 import (
@@ -79,7 +93,7 @@ func TestEmbedHeaderCtx_ErrExtractorReturnsError(t *testing.T) {
 // errReader forces a read error to simulate nonce generation failure.
 type errReader struct{ err error }
 
-func (e errReader) Read(p []byte) (int, error) { return 0, e.err }
+func (e errReader) Read(_ []byte) (int, error) { return 0, e.err }
 
 // TestEmbedHeaderCtx_ErrNonceReadFailure exercises the error path where the
 // crypto‑secure nonce cannot be generated (e.g., entropy source failure). We
