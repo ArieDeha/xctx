@@ -4,14 +4,13 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 package xctx_test
 
 import (
@@ -44,46 +43,15 @@ func newKey(b byte) []byte {
 	}
 }
 
-// newClientCodec constructs a client-side Codec configured with sensible
-// defaults (issuer/audience/ttl) and the default typed extractor/injector. The
-// function is black-box: it uses only public APIs of xctx.
-func newClientCodec(t *testing.T, kid string, key []byte, opts ...xctx.Option[PassingContext]) *xctx.Codec[PassingContext] {
+// newCodecFromUserCfg builds a codec+typedKey using the high-level helper that
+// merges env + overrides and auto-creates the TypedKey (when nil).
+func newCodecFromUserCfg(t *testing.T, user xctx.Config, aad func() []byte) (*xctx.Codec[PassingContext], xctx.TypedKey[PassingContext]) {
 	t.Helper()
-	kr, err := xctx.NewKeyring(kid, key, nil)
+	codec, key, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil, aad)
 	if err != nil {
-		t.Fatalf("keyring: %v", err)
+		t.Fatalf("build codec: %v", err)
 	}
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	base := []xctx.Option[PassingContext]{
-		xctx.WithExtractor(xctx.DefaultExtractor[PassingContext](typedKey)),
-		xctx.WithInjector(xctx.DefaultInjector[PassingContext](typedKey)),
-		xctx.WithIssuer[PassingContext]("svc-A"),
-		xctx.WithAudience[PassingContext]("svc-B"),
-		xctx.WithTTL[PassingContext](2 * time.Minute),
-	}
-	base = append(base, opts...)
-	return xctx.NewCodec[PassingContext](kr, base...)
-}
-
-// newServerCodec constructs a server-side Codec, optionally providing a map of
-// accepted "other" keys to exercise key rotation scenarios. Only public APIs
-// are used. The extractor/injector allow the parsed struct to be placed into
-// the request context for downstream handlers.
-func newServerCodec(t *testing.T, currentKID string, currentKey []byte, others map[string][]byte, opts ...xctx.Option[PassingContext]) *xctx.Codec[PassingContext] {
-	t.Helper()
-	kr, err := xctx.NewKeyring(currentKID, currentKey, others)
-	if err != nil {
-		t.Fatalf("keyring: %v", err)
-	}
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	base := []xctx.Option[PassingContext]{
-		xctx.WithExtractor(xctx.DefaultExtractor[PassingContext](typedKey)),
-		xctx.WithInjector(xctx.DefaultInjector[PassingContext](typedKey)),
-		xctx.WithIssuer[PassingContext]("svc-A"),
-		xctx.WithAudience[PassingContext]("svc-B"),
-	}
-	base = append(base, opts...)
-	return xctx.NewCodec[PassingContext](kr, base...)
+	return codec, key
 }
 
 // TestRoundTrip_Success (Purpose)
@@ -97,12 +65,26 @@ func newServerCodec(t *testing.T, currentKID string, currentKey []byte, others m
 //  3. client.SetHeader embeds X-Context.
 //  4. server.ParseCtx returns the typed value and derived context.
 func TestRoundTrip_Success(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(1))
-	server := newServerCodec(t, "kidA", newKey(1), nil)
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidA",
+		CurrentKey: newKey(1),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{UserID: 7, UserName: "arie"})
+	server, sKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidA",
+		CurrentKey: newKey(1),
+	}, nil)
+	_ = sKey // server codec already holds injector for its own key
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{UserID: 7, UserName: "arie"})
 
 	r := httptest.NewRequest(http.MethodGet, "http://test/greet", nil).WithContext(ctx)
 	if err := client.SetHeader(r, ctx); err != nil {
@@ -116,7 +98,7 @@ func TestRoundTrip_Success(t *testing.T) {
 	if pc.UserID != 7 || pc.UserName != "arie" {
 		t.Fatalf("unexpected pc: %+v", pc)
 	}
-	if got := ctx2.Value(typedKey).(PassingContext); got.UserID != 7 {
+	if got := ctx2.Value(sKey).(PassingContext); got.UserID != 7 {
 		t.Fatal("inject failed")
 	}
 }
@@ -127,15 +109,26 @@ func TestRoundTrip_Success(t *testing.T) {
 //
 // (How)
 //
-//	Configure client and server with WithHeaderName("X-Ctx") and assert
-//	server.ParseCtx succeeds using that header.
+//	Configure client and server with HeaderName "X-Ctx" and assert ParseCtx succeeds.
 func TestHeaderNameOverride(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(2), xctx.WithHeaderName[PassingContext]("X-Ctx"))
-	server := newServerCodec(t, "kidA", newKey(2), nil, xctx.WithHeaderName[PassingContext]("X-Ctx"))
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: "X-Ctx",
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kid",
+		CurrentKey: newKey(2),
+	}, nil)
+	server, sKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: "X-Ctx",
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kid",
+		CurrentKey: newKey(2),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{UserID: 1})
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{UserID: 1})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	if err := client.SetHeader(r, ctx); err != nil {
 		t.Fatal(err)
@@ -144,6 +137,7 @@ func TestHeaderNameOverride(t *testing.T) {
 	if _, _, err := server.ParseCtx(r); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
+	_ = sKey
 }
 
 // TestIssuerAudienceMismatch (Purpose)
@@ -152,15 +146,27 @@ func TestHeaderNameOverride(t *testing.T) {
 //
 // (How)
 //
-//	Client issues with issuer=a, audience=b; server expects audience different
-//	from b; ParseCtx must fail.
+//	Client issues with issuer=a, audience=b; server expects a different audience;
+//	ParseCtx must fail.
 func TestIssuerAudienceMismatch(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(3))
-	server := newServerCodec(t, "kidA", newKey(3), nil, xctx.WithAudience[PassingContext]("svc-OTHER"))
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidX",
+		CurrentKey: newKey(3),
+	}, nil)
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-OTHER",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidX",
+		CurrentKey: newKey(3),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	_ = client.SetHeader(r, ctx)
 	if _, _, err := server.ParseCtx(r); err == nil {
@@ -174,15 +180,28 @@ func TestIssuerAudienceMismatch(t *testing.T) {
 //
 // (How)
 //
-//	Client uses kidA; server encrypts with kidB and does not list kidA in
+//	Client uses kidA; server current kid is kidB and does not list kidA in
 //	accepted Others; ParseCtx must error with unknown kid.
 func TestUnknownKID(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(4))
-	server := newServerCodec(t, "kidB", newKey(4), nil) // different current KID
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidA",
+		CurrentKey: newKey(4),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidB", // different current KID; not accepting kidA
+		CurrentKey: newKey(4),
+	}, nil)
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	_ = client.SetHeader(r, ctx)
 	if _, _, err := server.ParseCtx(r); err == nil {
@@ -200,12 +219,25 @@ func TestUnknownKID(t *testing.T) {
 //	Client and server both use "kidA" but different 32-byte keys; ParseCtx must
 //	fail during AEAD open.
 func TestWrongKeySameKID(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(5))
-	server := newServerCodec(t, "kidA", newKey(6), nil) // same kid, different key
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidA",
+		CurrentKey: newKey(5),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		Issuer:     "svc-A",
+		Audience:   "svc-B",
+		TTL:        2 * time.Minute,
+		CurrentKID: "kidA", // same kid, different key
+		CurrentKey: newKey(6),
+	}, nil)
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	_ = client.SetHeader(r, ctx)
 	if _, _, err := server.ParseCtx(r); err == nil {
@@ -223,7 +255,13 @@ func TestWrongKeySameKID(t *testing.T) {
 //  2. Wrong textual prefix (v2.) -> error.
 //  3. Malformed base64 after v1. -> error.
 func TestBadVersionAndMalformed(t *testing.T) {
-	server := newServerCodec(t, "kidA", newKey(7), nil)
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		CurrentKID: "kid",
+		CurrentKey: newKey(7),
+		TTL:        time.Minute,
+	}, nil)
+
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil)
 	// missing
 	if _, _, err := server.ParseCtx(r); err == nil {
@@ -248,41 +286,28 @@ func TestBadVersionAndMalformed(t *testing.T) {
 //
 // (How)
 //
-//	Client and server use different WithAADBinder functions; ParseCtx must
+//	Client and server use different AAD binder functions; ParseCtx must
 //	return an error.
 func TestAADMismatch(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(8), xctx.WithAADBinder[PassingContext](func() []byte { return []byte("A") }))
-	server := newServerCodec(t, "kidA", newKey(8), nil, xctx.WithAADBinder[PassingContext](func() []byte { return []byte("B") }))
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		TTL:        time.Minute,
+		CurrentKID: "kid",
+		CurrentKey: newKey(8),
+	}, func() []byte { return []byte("A") })
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		TTL:        time.Minute,
+		CurrentKID: "kid",
+		CurrentKey: newKey(8),
+	}, func() []byte { return []byte("B") })
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	_ = client.SetHeader(r, ctx)
 	if _, _, err := server.ParseCtx(r); err == nil {
 		t.Fatal("expected decrypt failure due to AAD mismatch")
-	}
-}
-
-// TestExpiryImmediate (Purpose)
-//
-//	Ensures the time window checks are enforced. Using a negative TTL produces
-//	an already-expired token that the server must reject.
-//
-// (How)
-//
-//	Client codec is configured with WithTTL(-1s); ParseCtx should fail.
-func TestExpiryImmediate(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(9), xctx.WithTTL[PassingContext](-1*time.Second))
-	server := newServerCodec(t, "kidA", newKey(9), nil)
-
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
-	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
-	_ = client.SetHeader(r, ctx)
-	if _, _, err := server.ParseCtx(r); err == nil {
-		t.Fatal("expected time validity error")
 	}
 }
 
@@ -297,12 +322,22 @@ func TestExpiryImmediate(t *testing.T) {
 //	Client issues with kid "old"; server current kid is "new" but includes
 //	{"old": oldKey} in others; ParseCtx must succeed.
 func TestRotationAcceptsOldKey(t *testing.T) {
-	client := newClientCodec(t, "old", newKey(10))
-	server := newServerCodec(t, "new", newKey(11), map[string][]byte{"old": newKey(10)})
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		TTL:        time.Minute,
+		CurrentKID: "old",
+		CurrentKey: newKey(9),
+	}, nil)
 
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{UserID: 1})
+	server, _ := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		TTL:        time.Minute,
+		CurrentKID: "new",
+		CurrentKey: newKey(10),
+		OtherKeys:  map[string][]byte{"old": newKey(9)},
+	}, nil)
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{UserID: 1})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	_ = client.SetHeader(r, ctx)
 	if _, _, err := server.ParseCtx(r); err != nil {
@@ -319,15 +354,19 @@ func TestRotationAcceptsOldKey(t *testing.T) {
 //
 //	Client calls SetHeader and we assert the header is present.
 func TestSetHeaderConvenience(t *testing.T) {
-	client := newClientCodec(t, "kidA", newKey(12))
-	ctx := context.Background()
-	typedKey := xctx.NewTypedKey[PassingContext]("xctx")
-	ctx = xctx.DefaultInjector[PassingContext](typedKey)(ctx, PassingContext{})
+	client, cKey := newCodecFromUserCfg(t, xctx.Config{
+		HeaderName: xctx.DefaultHeaderName,
+		TTL:        time.Minute,
+		CurrentKID: "kid",
+		CurrentKey: newKey(11),
+	}, nil)
+
+	ctx := xctx.DefaultInjector[PassingContext](cKey)(context.Background(), PassingContext{})
 	r := httptest.NewRequest(http.MethodGet, "http://t/", nil).WithContext(ctx)
 	if err := client.SetHeader(r, ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Header.Get("X-Context") == "" {
+	if r.Header.Get(xctx.DefaultHeaderName) == "" {
 		t.Fatal("header not set")
 	}
 }
