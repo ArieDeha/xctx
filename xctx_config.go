@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// xctx_config.go
-//
+// file: xctx_config.go
+
 // Configuration helpers for the xctx package.
 //
 // This file provides a non-generic Config plus utilities to:
