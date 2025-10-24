@@ -1,3 +1,4 @@
+<?php
 // SPDX-License-Identifier: Apache-2.0
 
 // Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
@@ -14,10 +15,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// file: ./example/callee/go.mod
+// file: ./src/Xctx/Exception/ValidationException.php
 
-module github.com/ArieDeha/xctx/example/callee
+declare(strict_types=1);
 
-go 1.23
+namespace ArieDeha\Xctx\Exception;
 
-require github.com/ArieDeha/xctx v0.2.1
+class ValidationException extends \RuntimeException {}

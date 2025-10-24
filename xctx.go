@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// file: xctx.go
+// file: ./xctx.go
 
 // Package xctx provides typed, encrypted propagation of contextual information
 // between HTTP services using a single request header (default: "X-Context").

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,142 +16,293 @@
 
 // file: ./example/callee/main.go
 
-// Command callee
+// Go xctx “callee” service (listens on :8081).
 //
-// This is the receiving side of the xctx demo. It shows how a service can:
-//  1. Build an xctx *Codec* for a *typed* payload.
-//  2. Parse the encrypted "X-Context" header from inbound requests.
-//  3. Validate claims (issuer/audience/time) and inject the typed struct into
-//     the request context.
-//  4. Read that typed struct in handlers without ever touching maps or
-//     reflection.
+// What this file demonstrates
+// --------------------------
+//  1. How to construct a typed xctx.Codec[T] with env + overrides using
+//     BuildCodecFromEnvWithKey (from xctx_config.go), which auto-wires
+//     DefaultExtractor/DefaultInjector for a process-unique TypedKey[T].
+//  2. How to parse an inbound header straight from *http.Request using
+//     codec.ParseCtx(r) (from xctx.go).
+//  3. How to re-embed a typed payload by first putting it into a Context
+//     with DefaultInjector(typedKey) and then calling codec.EmbedHeaderCtx(ctx).
+//  4. Plain “whoami” and “update” endpoints plus two relay flows:
+//     /relay/php         – simple relay to the PHP callee /whoami
+//     /relay/php/update  – Chain A: Go → PHP(update) → Go(update) → caller
 //
-// Quick start (local demo):
+// Every handler prints the incoming context so you can observe end-to-end flow.
 //
-//	# Terminal A – start the callee (this process)
+// Run
+// ---
+//
 //	go run ./example/callee
 //
-//	# Terminal B – start the matching caller example (issues the header)
-//	go run ./example/caller
-//
-//	# Call the callee endpoint; it will show the values from the propagated ctx
-//	curl -s http://127.0.0.1:8081/whoami | jq
-//
-// Configuration:
-//
-//	The callee pulls configuration from two sources and merges them:
-//	  • Environment (see variables below)
-//	  • A local "user" Config literal (sane defaults for demo)
-//	The merge is: env → overridden by user → defaults → validated.
-//
-//	Recognized environment variables (optional unless noted):
-//	  XCTX_HEADER_NAME     – header name (default: "X-Context")
-//	  XCTX_ISSUER          – expected issuer (optional)
-//	  XCTX_AUDIENCE        – expected audience (optional)
-//	  XCTX_TTL             – duration, e.g. "2m" (default: 5m)
-//	  XCTX_CURRENT_KID     – current key id (required if user config omits it)
-//	  XCTX_CURRENT_KEY     – current 32B key; hex/base64/raw accepted
-//	  XCTX_OTHER_KEYS      – CSV of kid=key for accepted old keys
-//	  XCTX_TYPED_KEY_NAME  – local-only name for the typed key (default: "xctx")
-//
-// Security notes:
-//   - The header is sealed with AES‑256‑GCM. Decryption also validates integrity
-//     (tamper resistance) and checks time-window constraints (nbf/exp).
-//   - Issuer/Audience checks are enforced when configured on both sides.
-//   - Additional Authenticated Data (AAD) can be configured at codec build time,
-//     but must match **exactly** between caller and callee. For simplicity this
-//     demo does not set AAD; to enable it, provide the same binder function to
-//     BuildCodecFromEnvWithKey on both sides.
+// Requires the PHP callee running at 127.0.0.1:8082 for the relay endpoints.
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	xctx "github.com/ArieDeha/xctx"
 )
 
-// PassingContext is the *typed* payload we propagate between services.
-// You decide the schema; the library never reflects or inspects it.
+// PassingContext is your typed payload carried between services.
+// The library is schema-agnostic; you own this definition.
 type PassingContext struct {
-	UserID   int32  `json:"uid"`
-	UserName string `json:"un"`
+	UserID   int32  `json:"user_id"`
+	UserName string `json:"user_name"`
 	Role     string `json:"role,omitempty"`
 }
 
-// serverDeps groups runtime dependencies the handlers need: the xctx codec and
-// the typed key used to retrieve the injected struct from request contexts.
-type serverDeps struct {
-	codec *xctx.Codec[PassingContext]
-	tkey  xctx.TypedKey[PassingContext]
+var (
+	codec    *xctx.Codec[PassingContext]   // AEAD + claims checker
+	typedKey xctx.TypedKey[PassingContext] // process-unique key identity
+)
+
+// writeJSON writes JSON with the supplied HTTP status code.
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
-// main wires configuration, builds the xctx codec, installs a middleware that
-// parses the header into the request context, and serves an example endpoint.
-func main() {
-	// --- 1) Define user overrides (kept small; env can replace any field) ---
-	user := xctx.Config{
-		HeaderName: xctx.DefaultHeaderName, // keep the default; override via env if needed
-		Issuer:     "svc-caller",           // what we expect the caller to set as issuer
-		Audience:   "svc-callee",           // who the token targets (this service)
-		TTL:        2 * time.Minute,        // acceptable lifetime
-
-		// For local demo we inline a key; prefer env or a secret store in prod.
-		CurrentKID: "kid-demo",
-		CurrentKey: []byte("0123456789abcdef0123456789abcdef"), // MUST be 32 bytes
-		// OtherKeys: map[string][]byte{"old": <32B>}, // accept previous keys if rotating
-		// TypedKeyName: "xctx", // optional; default is "xctx"
-	}
-
-	// --- 2) Build codec & typed key from env + user config ---
-	codec, typedKey, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil /* auto-create key from TypedKeyName */, nil /* no AAD for this demo */)
-	if err != nil {
-		log.Fatalf("xctx: build codec: %v", err)
-	}
-
-	deps := &serverDeps{codec: codec, tkey: typedKey}
-
-	mux := http.NewServeMux()
-	mux.Handle("/whoami", deps.ctxMiddleware(http.HandlerFunc(deps.handleWhoAmI)))
-
-	log.Printf("callee listening on :8081 …")
-	if err := http.ListenAndServe(":8081", mux); err != nil {
-		log.Fatal(err)
-	}
+// logCtx prints a one-line record of what we received, for observability.
+func logCtx(where string, ctx PassingContext) {
+	log.Printf("[%s] incoming ctx: user_id=%d user_name=%q role=%q",
+		where, ctx.UserID, ctx.UserName, ctx.Role)
 }
 
-// ctxMiddleware parses the encrypted header using the codec and, on success,
-// injects the typed PassingContext into a derived request context.
+// goUpdate deterministically mutates the typed context (demo purpose only).
+// Contract:
+//   - user_name += "+go" (or "go" if empty)
+//   - role      += "|go" (or "go" if empty)
+func goUpdate(in PassingContext) PassingContext {
+	out := in
+	if out.UserName != "" {
+		out.UserName += "+go"
+	} else {
+		out.UserName = "go"
+	}
+	if out.Role != "" {
+		out.Role += "|go"
+	} else {
+		out.Role = "go"
+	}
+	return out
+}
+
+// embedTyped produces an ("X-Context", value) pair from a typed payload.
+// IMPORTANT: EmbedHeaderCtx reads the payload from context via the configured
+// Extractor, so we must first place the typed value into a Context using the
+// SAME TypedKey[T] that the codec’s DefaultExtractor expects.
+func embedTyped(v PassingContext) (name, value string, err error) {
+	// Put the typed value into a fresh Context under our process-unique key.
+	ctx := xctx.DefaultInjector[PassingContext](typedKey)(context.Background(), v)
+
+	// Now seal into the header directly from Context.
+	return codec.EmbedHeaderCtx(ctx) // (name="X-Context", value="v1.<...>", err)
+}
+
+// whoamiHandler parses the inbound header, logs the context, and returns it.
 //
-// Failure policy:
-//   - Missing/invalid header → 401 Unauthorized (adjust for your app needs).
-//   - On success, the next handler sees r.Context() carrying PassingContext.
-func (s *serverDeps) ctxMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, _, err := s.codec.ParseCtx(r)
-		if err != nil {
-			// You can examine err.Error() to distinguish causes (unknown kid, time, etc.).
-			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(ctx))
+// Uses codec.ParseCtx(r) which:
+//   - reads the header (default "X-Context"),
+//   - decrypts & validates claims,
+//   - injects T back to a derived context (when an Injector is set),
+//   - returns (newCtx, typedValue, error).
+func whoamiHandler(w http.ResponseWriter, r *http.Request) {
+	newCtx, ctxData, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
+	}
+	_ = newCtx // kept for symmetry; handlers often pass this downstream
+	logCtx("go:/whoami", ctxData)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server": "go-callee",
+		"ctx":    ctxData,
+		// Claims are private to the server; this demo only returns ctx.
 	})
 }
 
-// handleWhoAmI reads the typed value from the request context using the typed
-// key and emits a small JSON response.
-//
-// This demonstrates that the rest of your application logic never needs to
-// know about header formats, cryptography, or generic maps—it just reads a
-// typed struct from context.
-func (s *serverDeps) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
-	pc, _ := r.Context().Value(s.tkey).(PassingContext) // zero if absent (middleware guards it)
-	resp := map[string]any{
-		"ok":   true,
-		"user": pc,
+// updateHandler parses → logs → mutates and returns both prev/updated.
+func updateHandler(w http.ResponseWriter, r *http.Request) {
+	_, prev, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
 	}
+	logCtx("go:/update", prev)
+	updated := goUpdate(prev)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server":      "go-callee",
+		"prev_ctx":    prev,
+		"updated_ctx": updated,
+	})
+}
+
+// relayPHPWhoamiHandler is a simple relay to the PHP callee /whoami.
+// Flow: parse here → re-embed → GET http://127.0.0.1:8082/whoami with X-Context.
+func relayPHPWhoamiHandler(w http.ResponseWriter, r *http.Request) {
+	_, ctxData, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
+	}
+	logCtx("go:/relay/php", ctxData)
+
+	name, val, err := embedTyped(ctxData)
+	fmt.Println("X-Context (raw):", val)
+	if strings.HasPrefix(val, "v1.") {
+		dec, _ := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(val, "v1."))
+		fmt.Println("Envelope JSON:", string(dec)) // shows {"V":1,"Alg":"AES-256-GCM",...}
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("re-embed failed: %v", err),
+		})
+		return
+	}
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://127.0.0.1:8082/whoami", nil)
+	req.Header.Set(name, val)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("forward to php failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// phpUpdateResp is what PHP /update returns (prev/updated).
+type phpUpdateResp struct {
+	Server  string         `json:"server"`
+	Prev    PassingContext `json:"prev_ctx"`
+	Updated PassingContext `json:"updated_ctx"`
+	Error   string         `json:"error,omitempty"`
+}
+
+// relayPHPUpdateHandler implements Chain A:
+// caller → go(/relay/php/update) → php(/update) → go(mutates) → caller
+func relayPHPUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	_, original, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
+	}
+	logCtx("go:/relay/php/update original", original)
+
+	name, val, err := embedTyped(original)
+	fmt.Println("X-Context (raw):", val)
+	if strings.HasPrefix(val, "v1.") {
+		dec, _ := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(val, "v1."))
+		fmt.Println("Envelope JSON:", string(dec)) // shows {"V":1,"Alg":"AES-256-GCM",...}
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("re-embed failed: %v", err),
+		})
+		return
+	}
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://127.0.0.1:8082/update", nil)
+	req.Header.Set(name, val)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("forward to php failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var phpOut phpUpdateResp
+	if err := json.NewDecoder(resp.Body).Decode(&phpOut); err != nil || phpOut.Server == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("bad php response: %v", err),
+		})
+		return
+	}
+	logCtx("go:/relay/php/update php-updated", phpOut.Updated)
+
+	goUpdated := goUpdate(phpOut.Updated)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server":          "go-callee",
+		"prev_ctx":        original,
+		"php_updated_ctx": phpOut.Updated,
+		"go_updated_ctx":  goUpdated,
+	})
+}
+
+func main() {
+	// Build codec (env + overrides) and get the process-unique TypedKey[T].
+	// These helpers are defined in xctx_config.go, and they wire defaults,
+	// env override, validation, plus DefaultExtractor/Injector with TypedKey.  (ref)
+	// (You may also use BuildCodecWithKey if you want to supply your own key.)
+	user := xctx.Config{
+		HeaderName:   "X-Context",
+		Issuer:       "svc-caller",
+		Audience:     "svc-callee",
+		TTL:          2 * time.Minute,
+		CurrentKID:   "kid-demo",
+		CurrentKey:   []byte("0123456789abcdef0123456789abcdef"), // 32 bytes
+		TypedKeyName: "xctx",
+	}
+	aad := func() []byte { return []byte("TENANT=blue|ENV=dev") }
+
+	c, tk, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil, aad)
+	if err != nil {
+		log.Fatalf("codec build: %v", err)
+	}
+	codec, typedKey = c, tk
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/whoami", whoamiHandler)
+	mux.HandleFunc("/update", updateHandler)
+	mux.HandleFunc("/relay/php", relayPHPWhoamiHandler)
+	mux.HandleFunc("/relay/php/update", relayPHPUpdateHandler)
+
+	srv := &http.Server{
+		Addr:              ":8081",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	log.Println("go-callee listening on :8081")
+	log.Fatal(srv.ListenAndServe())
 }

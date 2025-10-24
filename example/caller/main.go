@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,129 +16,135 @@
 
 // file: ./example/caller/main.go
 
-// Command caller
+// Go xctx “caller” program.
+// Produces a typed context, seals it into X-Context using EmbedHeaderCtx(ctx),
+// and calls both the Go callee (:8081) and the PHP callee (:8082), including
+// the two relay scenarios with context mutation.
 //
-// This is the sending side of the xctx demo. It shows how a service can:
-//  1. Build an xctx *Codec* for a *typed* payload.
-//  2. Put that typed payload into a request context.
-//  3. Seal the payload into a single encrypted header (default: "X-Context").
-//  4. Call a downstream service (the callee), which will parse and validate it.
+// Key points
+// ----------
+//   - To seal, we must put the typed value into a Context using the SAME
+//     TypedKey[T] instance the codec’s DefaultExtractor expects.
+//   - We obtain that TypedKey[T] from BuildCodecFromEnvWithKey(...).
+//   - We then call codec.EmbedHeaderCtx(ctx) to get ("X-Context", value).
 //
-// Quick start (local demo):
+// Endpoints called
+// ----------------
+// 1) /whoami on both Golang and PHP callees
+// 2) /relay/php and /relay/go (simple relays)
+// 3) /relay/php/update (Chain A: Go → PHP.update → Go.update)
+// 4) /relay/go/update  (Chain B: PHP → Go.update → PHP back to caller)
 //
-//	# Terminal A – start the callee (receiver)
-//	go run ./example/callee
+// Run
+// ---
 //
-//	# Terminal B – run the caller (this process)
 //	go run ./example/caller
-//
-//	# You should see the callee respond with the propagated typed payload.
-//
-// Configuration merge order:
-//   - Environment → overridden by user → defaults → validated
-//     Recognized environment variables (optional unless noted):
-//     XCTX_HEADER_NAME     – header name (default: "X-Context")
-//     XCTX_ISSUER          – value the caller writes as issuer (optional)
-//     XCTX_AUDIENCE        – value the caller writes as audience (optional)
-//     XCTX_TTL             – duration, e.g. "2m" (default: 5m)
-//     XCTX_CURRENT_KID     – current key id (required if user config omits it)
-//     XCTX_CURRENT_KEY     – current 32B key; hex/base64/raw accepted
-//     XCTX_OTHER_KEYS      – CSV of kid=key (rarely needed on caller)
-//     XCTX_TYPED_KEY_NAME  – local-only name for the typed key (default: "xctx")
-//
-// Security notes:
-//   - The header is AES‑256‑GCM sealed and authenticated.
-//   - Issuer/Audience you set here must match what the callee expects.
-//   - If you use AAD (additional authenticated data), both sides must supply the
-//     same bytes via the builder; otherwise decryption will fail on the callee.
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"time"
 
 	xctx "github.com/ArieDeha/xctx"
 )
 
-// PassingContext is the *typed* payload we propagate to the callee.
-// Keep it compact to avoid large headers; the library never inspects it.
 type PassingContext struct {
-	UserID   int32  `json:"uid"`
-	UserName string `json:"un"`
+	UserID   int32  `json:"user_id"`
+	UserName string `json:"user_name"`
 	Role     string `json:"role,omitempty"`
 }
 
-// main wires configuration, builds the xctx codec, constructs a sample payload,
-// embeds it into the outbound request as a sealed header, and prints callee's
-// JSON response.
+type chainAResp struct {
+	Server     string         `json:"server"`
+	Prev       PassingContext `json:"prev_ctx"`
+	PHPUpdated PassingContext `json:"php_updated_ctx"`
+	GoUpdated  PassingContext `json:"go_updated_ctx"`
+	Error      string         `json:"error,omitempty"`
+}
+
+type chainBResp struct {
+	Server  string         `json:"server"`
+	Prev    PassingContext `json:"prev_ctx"`
+	Updated PassingContext `json:"updated_ctx"`
+	Error   string         `json:"error,omitempty"`
+}
+
 func main() {
-	calleeURL := getenv("CALLEE_URL", "http://127.0.0.1:8081/whoami")
-
-	// --- 1) Define user overrides (env can replace any field) ---
+	// 1) Build a Codec and obtain a process-unique TypedKey[T].
 	user := xctx.Config{
-		HeaderName: xctx.DefaultHeaderName,
-		Issuer:     "svc-caller", // the callee will expect this
-		Audience:   "svc-callee", // target audience (the callee)
-		TTL:        2 * time.Minute,
-
-		// For demo we inline a key; in production prefer env or a secret store.
-		CurrentKID: "kid-demo",
-		CurrentKey: []byte("0123456789abcdef0123456789abcdef"), // MUST be 32 bytes
-		// OtherKeys: map[string][]byte{"old": <32B>},
-		// TypedKeyName: "xctx", // optional local-only name
+		HeaderName:   "X-Context",
+		Issuer:       "svc-caller",
+		Audience:     "svc-callee",
+		TTL:          2 * time.Minute,
+		CurrentKID:   "kid-demo",
+		CurrentKey:   []byte("0123456789abcdef0123456789abcdef"),
+		TypedKeyName: "xctx",
 	}
+	aad := func() []byte { return []byte("TENANT=blue|ENV=dev") }
 
-	// --- 2) Build codec & typed key from env + user config ---
-	codec, typedKey, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil /* auto-create key from TypedKeyName */, nil /* no AAD for this demo */)
+	codec, typedKey, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil, aad)
 	if err != nil {
-		log.Fatalf("xctx: build codec: %v", err)
+		log.Fatalf("codec build: %v", err)
 	}
 
-	// --- 3) Craft the typed payload we want to propagate ---
-	pc := PassingContext{UserID: 42, UserName: "arie", Role: "admin"}
+	// 2) Create our typed payload and seal it into X-Context.
+	payload := PassingContext{UserID: 7, UserName: "arie", Role: "admin"}
 
-	// --- 4) Build request, put typed value in context, and seal header ---
-	req, err := http.NewRequest(http.MethodGet, calleeURL, nil)
+	// Place payload into a Context using SAME TypedKey the codec expects.
+	ctx := xctx.DefaultInjector[PassingContext](typedKey)(context.Background(), payload)
+
+	// Seal to ("X-Context", "v1.<...>").
+	name, value, err := codec.EmbedHeaderCtx(ctx)
 	if err != nil {
-		log.Fatalf("new request: %v", err)
+		log.Fatalf("embed: %v", err)
 	}
 
-	ctx := xctx.DefaultInjector[PassingContext](typedKey)(req.Context(), pc)
-	if err := codec.SetHeader(req, ctx); err != nil {
-		log.Fatalf("embed header: %v", err)
+	// Helper: GET url with our header and print the body.
+	call := func(url string) string {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+		req.Header.Set(name, value)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("GET %s: %v", url, err)
+			return ""
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("\n== %s [%d] ==\n%s\n", url, resp.StatusCode, string(body))
+		return string(body)
 	}
 
-	// --- 5) Send and pretty-print the JSON response ---
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Fatalf("http do: %v", err)
-	}
-	defer resp.Body.Close()
+	// 3) Basic calls + simple relays
+	_ = call("http://127.0.0.1:8081/whoami")    // Go callee
+	_ = call("http://127.0.0.1:8082/whoami")    // PHP callee
+	_ = call("http://127.0.0.1:8081/relay/php") // Go → PHP relay
+	_ = call("http://127.0.0.1:8082/relay/go")  // PHP → Go relay
 
-	body, _ := io.ReadAll(resp.Body)
-	pretty := prettyJSON(body)
-	fmt.Printf("HTTP %d\n%s\n", resp.StatusCode, pretty)
-}
-
-// prettyJSON attempts to format JSON or falls back to raw body.
-func prettyJSON(b []byte) string {
-	var buf bytes.Buffer
-	if err := json.Indent(&buf, b, "", "  "); err != nil {
-		return string(b)
+	// 4) Chain A: caller → go → php(update) → go(update) → caller
+	{
+		body := call("http://127.0.0.1:8081/relay/php/update")
+		var out chainAResp
+		_ = json.Unmarshal([]byte(body), &out)
+		if out.Server != "" {
+			fmt.Printf("\n[Chain A] prev        = %+v\n", out.Prev)
+			fmt.Printf("[Chain A] php-updated = %+v\n", out.PHPUpdated)
+			fmt.Printf("[Chain A] go-updated  = %+v\n", out.GoUpdated)
+		}
 	}
-	return buf.String()
-}
 
-// getenv returns env[k] or def if unset/empty.
-func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+	// 5) Chain B: caller → php → go(update) → php → caller
+	{
+		body := call("http://127.0.0.1:8082/relay/go/update")
+		var out chainBResp
+		_ = json.Unmarshal([]byte(body), &out)
+		if out.Server != "" {
+			fmt.Printf("\n[Chain B] prev    = %+v\n", out.Prev)
+			fmt.Printf("[Chain B] updated = %+v\n", out.Updated)
+		}
 	}
-	return def
 }

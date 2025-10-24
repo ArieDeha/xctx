@@ -1,0 +1,38 @@
+{
+    "name": "ariedeha/xctx",
+    "description": "Cross Context - Encrypted, signed, typed context propagation over a single HTTP header.",
+    "type": "library",
+    "version": "0.2.1",
+    "license": "Apache-2.0",
+    "autoload": {
+        "psr-4": {
+            "ArieDeha\\Xctx\\": "src/Xctx"
+        }
+    },
+    "authors": [
+        {
+            "name": "Arieditya Pramadyana Deha",
+            "email": "arieditya.prdh@live.com"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require": {
+        "php": ">=8.2",
+        "ext-openssl": "*",
+        "ext-ctype": "*",
+        "ext-curl": "*",
+        "psr/http-message": "1.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5",
+        "guzzlehttp/psr7": "^2.6"
+    },
+    "suggest": {
+        "psr/http-message": "For PSR-7 request helper in Codec::setHeader/parseFromRequest",
+        "ext-curl": "For CurlTransport"
+    },
+    "scripts": {
+        "test": "phpunit --colors=always",
+        "coverage": "phpunit --coverage-clover clover.xml"
+    }
+}

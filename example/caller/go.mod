@@ -1,5 +1,5 @@
-// Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
-//
+// SPDX-License-Identifier: Apache-2.0
+
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,5 +19,5 @@ module github.com/ArieDeha/xctx/example/caller
 go 1.23
 
 require (
-	github.com/ArieDeha/xctx v0.1.3
+	github.com/ArieDeha/xctx v0.2.1
 )
