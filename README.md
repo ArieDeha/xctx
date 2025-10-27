@@ -18,7 +18,7 @@ limitations under the License.
 -->
 <!-- file: README.md -->
 <!-- author: Arieditya Pramadyana Deha <arieditya.prdh@live.com> -->
-# xctx
+# xctx - Cross Context
 
 Encrypted, signed, **typed** context propagation over a single HTTP header (`X-Context`) with **Go** and **PHP** reference implementations.
 

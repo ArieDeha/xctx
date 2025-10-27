@@ -16,7 +16,7 @@
 
 // file: ./example/callee/go.mod
 
-module github.com/ArieDeha/xctx/example/callee
+module example/callee
 
 go 1.23
 
