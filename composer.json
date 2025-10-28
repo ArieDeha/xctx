@@ -2,7 +2,7 @@
     "name": "ariedeha/xctx",
     "description": "Cross Context - Encrypted, signed, typed context propagation over a single HTTP header.",
     "type": "library",
-    "version": "0.2.1",
+    "version": "0.3.2",
     "license": "Apache-2.0",
     "autoload": {
         "psr-4": {

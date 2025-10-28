@@ -1,6 +1,6 @@
 {
   "name": "xctx",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Encrypted, signed, typed context propagation over a single HTTP header (`X-Context`) with NodeJS, Go and PHP reference implementations.",
   "private": false,
   "type": "module",

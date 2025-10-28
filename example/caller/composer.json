@@ -1,0 +1,21 @@
+{
+    "name": "ariedeha/xctx-example-caller",
+    "description": "xctx example caller (PHP) using xctx as a library",
+    "minimum-stability": "stable",
+    "type": "project",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "Arieditya Pramadyana Deha",
+            "email": "arieditya.prdh@live.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-openssl": "*",
+        "ariedeha/xctx": "^0.3"
+    },
+    "scripts": {
+        "start": "php main.php"
+    }
+}

@@ -20,4 +20,4 @@ module example/caller
 
 go 1.23
 
-require github.com/ArieDeha/xctx v0.2.1
+require github.com/ArieDeha/xctx v0.3.2

@@ -1,0 +1,15 @@
+{
+  "name": "xctx-example-callee-node",
+  "private": true,
+  "version": "0.0.0",
+  "description": "xctx example callee (Node.js) using xctx as a dependency",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node main.node.mjs",
+    "start:express": "node main.express.mjs"
+  },
+  "dependencies": {
+    "xctx": "^0.3.2"
+  }
+}

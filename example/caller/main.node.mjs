@@ -1,114 +1,79 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * file: ./example/caller/main.node.mjs
- *
- * NodeJS xctx “caller” program.
- *
- * What this file demonstrates
- * --------------------------
- *  1) Build a Codec and seal a typed payload into ("X-Context", "v1.<...>").
- *  2) Call the three callees (Go, PHP, Node) /whoami with that header.
- *  3) Simple relays across languages.
- *  4) Two chain flows that perform mutation in a second callee and then in the origin:
- *       - Chain A (Go→PHP→Go)
- *       - Chain B (PHP→Go→PHP)
- *       - Chain C (Go→Node→Go)
- *       - Chain D (PHP→Node→PHP)
- *
- * Build & Run
- * -----------
- *    npm install
- *    npm run build           # generate ./dist/nodejs/esm
- *    node example/caller/main.node.mjs
+ * xctx example — Node.js Caller
+ * Now targets 4 callees:
+ *   - Go    :8081
+ *   - PHP   :8082
+ *   - Node  :8083 (native http)
+ *   - NodeE :8084 (Express)
  */
 
-import { resolveConfig, Codec } from '../../dist/nodejs/esm/index.js';
+import { resolveConfig, Codec } from 'xctx';
 
 /** @typedef {{ user_id: number, user_name: string, role?: string }} PassingContext */
 
 const cfg = resolveConfig({
-  headerName: 'X-Context',
-  issuer: 'svc-caller',
-  audience: 'svc-callee',
-  ttlSeconds: 120,
-  currentKid: 'kid-demo',
-  currentKey: '0123456789abcdef0123456789abcdef',
-  aadBinder: () => new TextEncoder().encode('TENANT=blue|ENV=dev'),
+    headerName: 'X-Context',
+    issuer: 'svc-caller',
+    audience: 'svc-callee',
+    ttlSeconds: 120,
+    currentKid: 'kid-demo',
+    currentKey: '0123456789abcdef0123456789abcdef',
+    aadBinder: () => new TextEncoder().encode('TENANT=blue|ENV=dev'),
 });
 /** @type {Codec<PassingContext>} */
 const codec = new Codec(cfg);
 
-/** Simple GET with header helper. */
-async function getWithHeader(url, name, value) {
-  try {
+function logBlock(title, status, body) {
+    console.log(`\n== ${title} [${status}] ==`);
+    console.log(typeof body === 'string' ? body : JSON.stringify(body, null, 2));
+}
+
+async function call(url, payload) {
+    const [name, value] = codec.embedHeader(payload);
     const r = await fetch(url, { headers: { [name]: value } });
-    const body = await r.text();
-    console.log(`\n== ${url} [${r.status}] ==\n${body}`);
-    return body;
-  } catch (e) {
-    console.error(`GET ${url}:`, e);
-    return '';
-  }
+    let body;
+    const text = await r.text();
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status: r.status, body };
 }
 
-// 1) Seal typed payload
-const payload = { user_id: 7, user_name: 'arie', role: 'admin' };
-const [name, value] = codec.embedHeader(payload);
+async function main() {
+    /** @type {PassingContext} */
+    const ctx = { user_id: 7, user_name: 'arie', role: 'admin' };
 
-// 2) Basics + simple relays
-await getWithHeader('http://127.0.0.1:8081/whoami', name, value); // go
-await getWithHeader('http://127.0.0.1:8082/whoami', name, value); // php
-await getWithHeader('http://127.0.0.1:8083/whoami', name, value); // node
-await getWithHeader('http://127.0.0.1:8081/relay/php', name, value); // go → php
-await getWithHeader('http://127.0.0.1:8082/relay/go',  name, value); // php → go
-await getWithHeader('http://127.0.0.1:8083/relay/go',  name, value); // node → go
-await getWithHeader('http://127.0.0.1:8083/relay/php', name, value); // node → php
+    const GO    = 'http://127.0.0.1:8081';
+    const PHP   = 'http://127.0.0.1:8082';
+    const NODE  = 'http://127.0.0.1:8083';
+    const NODEE = 'http://127.0.0.1:8084';
 
-// 3) Chains
-// Chain A: caller → go → php(update) → go(update) → caller
-{
-  const body = await getWithHeader('http://127.0.0.1:8081/relay/php/update', name, value);
-  try {
-    const out = JSON.parse(body);
-    if (out?.server) {
-      console.log(`\n[Chain A] prev        =`, out.prev_ctx);
-      console.log(`[Chain A] php-updated =`, out.php_updated_ctx);
-      console.log(`[Chain A] go-updated  =`, out.go_updated_ctx);
+    // whoami/update on all four callees
+    for (const [name, base] of [['go', GO], ['php', PHP], ['node', NODE], ['node-express', NODEE]]) {
+        let r = await call(`${base}/whoami`, ctx);
+        logBlock(`${name} /whoami`, r.status, r.body);
+        r = await call(`${base}/update`, ctx);
+        logBlock(`${name} /update`, r.status, r.body);
     }
-  } catch {}
+
+    // Existing chains via node(:8083)
+    let r = await call(`${NODE}/relay/go`, ctx);
+    logBlock(`node → go /whoami`, r.status, r.body);
+    r = await call(`${NODE}/relay/go/update`, ctx);
+    logBlock(`node → go /update`, r.status, r.body);
+
+    r = await call(`${NODE}/relay/php`, ctx);
+    logBlock(`node → php /whoami`, r.status, r.body);
+    r = await call(`${NODE}/relay/php/update`, ctx);
+    logBlock(`node → php /update`, r.status, r.body);
+
+    // NEW: chains via node(:8083) → node-express(:8084)
+    r = await call(`${NODE}/relay/node-express`, ctx);
+    logBlock(`node → node-express /whoami`, r.status, r.body);
+    r = await call(`${NODE}/relay/node-express/update`, ctx);
+    logBlock(`node → node-express /update`, r.status, r.body);
 }
-// Chain B: caller → php → go(update) → php → caller
-{
-  const body = await getWithHeader('http://127.0.0.1:8082/relay/go/update', name, value);
-  try {
-    const out = JSON.parse(body);
-    if (out?.server) {
-      console.log(`\n[Chain B] prev    =`, out.prev_ctx);
-      console.log(`[Chain B] updated =`, out.updated_ctx);
-    }
-  } catch {}
-}
-// Chain C: caller → go → node(update) → go(update) → caller
-{
-  const body = await getWithHeader('http://127.0.0.1:8081/relay/node/update', name, value);
-  try {
-    const out = JSON.parse(body);
-    if (out?.server) {
-      console.log(`\n[Chain C] prev        =`, out.prev_ctx);
-      console.log(`[Chain C] node-updated =`, out.node_updated_ctx);
-      console.log(`[Chain C] go-updated   =`, out.go_updated_ctx);
-    }
-  } catch {}
-}
-// Chain D: caller → php → node(update) → php(update) → caller
-{
-  const body = await getWithHeader('http://127.0.0.1:8082/relay/node/update', name, value);
-  try {
-    const out = JSON.parse(body);
-    if (out?.server) {
-      console.log(`\n[Chain D] prev        =`, out.prev_ctx);
-      console.log(`[Chain D] node-updated =`, out.node_updated_ctx);
-      console.log(`[Chain D] php-updated  =`, out.php_updated_ctx);
-    }
-  } catch {}
-}
+
+main().catch((err) => {
+    console.error('[caller] fatal:', err);
+    process.exitCode = 1;
+});

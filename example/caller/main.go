@@ -1,44 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-
-// Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
+// Command caller demonstrates producing an outbound sealed header using the
+// 3rd-party xctx module, calling multiple services (Go/PHP/Node/Node-Express),
+// and printing their responses. It mirrors the Node caller flow.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// file: ./example/caller/main.go
-
-// Go xctx “caller” program.
-// Produces a typed context, seals it into X-Context using EmbedHeaderCtx(ctx),
-// and calls both the Go callee (:8081) and the PHP callee (:8082), including
-// the two relay scenarios with context mutation.
-//
-// Key points
-// ----------
-//   - To seal, we must put the typed value into a Context using the SAME
-//     TypedKey[T] instance the codec’s DefaultExtractor expects.
-//   - We obtain that TypedKey[T] from BuildCodecFromEnvWithKey(...).
-//   - We then call codec.EmbedHeaderCtx(ctx) to get ("X-Context", value).
-//
-// Endpoints called
-// ----------------
-// 1) /whoami on both Golang and PHP callees
-// 2) /relay/php and /relay/go (simple relays)
-// 3) /relay/php/update (Chain A: Go → PHP.update → Go.update)
-// 4) /relay/go/update  (Chain B: PHP → Go.update → PHP back to caller)
-//
-// Run
-// ---
-//
-//	go run ./example/caller
+// Calls:
+//   <base>/whoami
+//   <base>/update
+// Then chains via Node(:8083) to its relay endpoints (including -> node-express).
 package main
 
 import (
@@ -53,118 +21,128 @@ import (
 	xctx "github.com/ArieDeha/xctx"
 )
 
+// PassingContext must match the data the services expect/produce.
 type PassingContext struct {
-	UserID   int32  `json:"user_id"`
+	UserID   int    `json:"user_id"`
 	UserName string `json:"user_name"`
 	Role     string `json:"role,omitempty"`
 }
 
-type chainAResp struct {
-	Server     string         `json:"server"`
-	Prev       PassingContext `json:"prev_ctx"`
-	PHPUpdated PassingContext `json:"php_updated_ctx"`
-	GoUpdated  PassingContext `json:"go_updated_ctx"`
-	Error      string         `json:"error,omitempty"`
+var (
+	headerName = "X-Context"
+	issuer     = "svc-caller"
+	audience   = "svc-callee"
+	ttl        = 120 * time.Second
+
+	activeKID = "kid-demo"
+	activeKey = []byte("0123456789abcdef0123456789abcdef")
+
+	aadBytes = []byte("TENANT=blue|ENV=dev")
+
+	ctxKey   = xctx.NewTypedKey[PassingContext]("passing")
+	injector = xctx.DefaultInjector(ctxKey)
+
+	codec *xctx.Codec[PassingContext]
+)
+
+func initCodec() {
+	kr, err := xctx.NewKeyring(activeKID, activeKey, nil)
+	if err != nil {
+		log.Fatalf("keyring: %v", err)
+	}
+	codec = xctx.NewCodec[PassingContext](
+		kr,
+		xctx.WithHeaderName[PassingContext](headerName),
+		xctx.WithIssuer[PassingContext](issuer),
+		xctx.WithAudience[PassingContext](audience),
+		xctx.WithTTL[PassingContext](ttl),
+		xctx.WithAADBinder[PassingContext](func() []byte { return aadBytes }),
+		xctx.WithInjector[PassingContext](injector),
+	)
 }
 
-type chainBResp struct {
-	Server  string         `json:"server"`
-	Prev    PassingContext `json:"prev_ctx"`
-	Updated PassingContext `json:"updated_ctx"`
-	Error   string         `json:"error,omitempty"`
+func logBlock(title string, status int, body any) {
+	b, _ := json.MarshalIndent(body, "", "  ")
+	fmt.Printf("\n== %s [%d] ==\n%s\n", title, status, string(b))
+}
+
+func doGET(ctx context.Context, url string) (int, any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("build request: %w", err)
+	}
+	if err := codec.SetHeader(req, ctx); err != nil {
+		return 0, nil, fmt.Errorf("set header: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var j any
+	if json.Unmarshal(raw, &j) != nil {
+		j = string(raw)
+	}
+	return resp.StatusCode, j, nil
 }
 
 func main() {
-	// 1) Build a Codec and obtain a process-unique TypedKey[T].
-	user := xctx.Config{
-		HeaderName:   "X-Context",
-		Issuer:       "svc-caller",
-		Audience:     "svc-callee",
-		TTL:          2 * time.Minute,
-		CurrentKID:   "kid-demo",
-		CurrentKey:   []byte("0123456789abcdef0123456789abcdef"),
-		TypedKeyName: "xctx",
-	}
-	aad := func() []byte { return []byte("TENANT=blue|ENV=dev") }
+	initCodec()
 
-	codec, typedKey, err := xctx.BuildCodecFromEnvWithKey[PassingContext](user, nil, aad)
-	if err != nil {
-		log.Fatalf("codec build: %v", err)
+	// Initial typed payload for the outbound request.
+	payload := PassingContext{
+		UserID:   7,
+		UserName: "arie",
+		Role:     "admin",
 	}
 
-	// 2) Create our typed payload and seal it into X-Context.
-	payload := PassingContext{UserID: 7, UserName: "arie", Role: "admin"}
+	// Inject payload into context so EmbedHeaderCtx/SetHeader can find it.
+	ctx := injector(context.Background(), payload)
 
-	// Place payload into a Context using SAME TypedKey the codec expects.
-	ctx := xctx.DefaultInjector[PassingContext](typedKey)(context.Background(), payload)
+	const (
+		GO    = "http://127.0.0.1:8081"
+		PHP   = "http://127.0.0.1:8082"
+		NODE  = "http://127.0.0.1:8083"
+		NODEE = "http://127.0.0.1:8084"
+	)
 
-	// Seal to ("X-Context", "v1.<...>").
-	name, value, err := codec.EmbedHeaderCtx(ctx)
-	if err != nil {
-		log.Fatalf("embed: %v", err)
-	}
-
-	// Helper: GET url with our header and print the body.
-	call := func(url string) string {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
-		req.Header.Set(name, value)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Printf("GET %s: %v", url, err)
-			return ""
+	// whoami/update on all four callees
+	for _, it := range []struct {
+		name, base string
+	}{
+		{"go", GO},
+		{"php", PHP},
+		{"node", NODE},
+		{"node-express", NODEE},
+	} {
+		if st, body, err := doGET(ctx, it.base+"/whoami"); err != nil {
+			log.Printf("%s /whoami error: %v", it.name, err)
+		} else {
+			logBlock(it.name+" /whoami", st, body)
 		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("\n== %s [%d] ==\n%s\n", url, resp.StatusCode, string(body))
-		return string(body)
-	}
-
-	// 3) Basic calls + simple relays
-	_ = call("http://127.0.0.1:8081/whoami")    // Go callee
-	_ = call("http://127.0.0.1:8082/whoami")    // PHP callee
-	_ = call("http://127.0.0.1:8083/whoami")    // Node callee
-	_ = call("http://127.0.0.1:8081/relay/php") // Go → PHP relay
-	_ = call("http://127.0.0.1:8082/relay/go")  // PHP → Go relay
-	_ = call("http://127.0.0.1:8083/relay/go")  // Node → Go relay
-	_ = call("http://127.0.0.1:8083/relay/php") // Node → PHP relay
-
-	// 4) Chain A: caller → go → php(update) → go(update) → caller
-	{
-		body := call("http://127.0.0.1:8081/relay/php/update")
-		var out chainAResp
-		_ = json.Unmarshal([]byte(body), &out)
-		if out.Server != "" {
-			fmt.Printf("\n[Chain A] prev        = %+v\n", out.Prev)
-			fmt.Printf("[Chain A] php-updated = %+v\n", out.PHPUpdated)
-			fmt.Printf("[Chain A] go-updated  = %+v\n", out.GoUpdated)
+		if st, body, err := doGET(ctx, it.base+"/update"); err != nil {
+			log.Printf("%s /update error: %v", it.name, err)
+		} else {
+			logBlock(it.name+" /update", st, body)
 		}
 	}
 
-	// 5) Chain B: caller → php → go(update) → php → caller
-	{
-		body := call("http://127.0.0.1:8082/relay/go/update")
-		var out chainBResp
-		_ = json.Unmarshal([]byte(body), &out)
-		if out.Server != "" {
-			fmt.Printf("\n[Chain B] prev    = %+v\n", out.Prev)
-			fmt.Printf("[Chain B] updated = %+v\n", out.Updated)
+	// Chains via Node(:8083) including relays to Node-Express(:8084)
+	for _, path := range []struct {
+		title, url string
+	}{
+		{"node → go /whoami", NODE + "/relay/go"},
+		{"node → go /update", NODE + "/relay/go/update"},
+		{"node → php /whoami", NODE + "/relay/php"},
+		{"node → php /update", NODE + "/relay/php/update"},
+		{"node → node-express /whoami", NODE + "/relay/node-express"},
+		{"node → node-express /update", NODE + "/relay/node-express/update"},
+	} {
+		if st, body, err := doGET(ctx, path.url); err != nil {
+			log.Printf("%s error: %v", path.title, err)
+		} else {
+			logBlock(path.title, st, body)
 		}
 	}
-	// 6) Chain C: caller → go → node(update) → go(update) → caller
-	{
-		body := call("http://127.0.0.1:8081/relay/node/update")
-		var out struct {
-			Server      string         `json:"server"`
-			Prev        PassingContext `json:"prev_ctx"`
-			NodeUpdated PassingContext `json:"node_updated_ctx"`
-			GoUpdated   PassingContext `json:"go_updated_ctx"`
-		}
-		_ = json.Unmarshal([]byte(body), &out)
-		if out.Server != "" {
-			fmt.Printf("\n[Chain C] prev        = %+v\n", out.Prev)
-			fmt.Printf("[Chain C] node-updated = %+v\n", out.NodeUpdated)
-			fmt.Printf("[Chain C] go-updated   = %+v\n", out.GoUpdated)
-		}
-	}
-
 }

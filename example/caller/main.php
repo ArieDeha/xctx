@@ -1,113 +1,109 @@
 <?php
-// SPDX-License-Identifier: Apache-2.0
-
-// Copyright 2025 Arieditya Pramadyana Deha <arieditya.prdh@live.com>
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//	http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// file: ./example/caller/main.php
-
 /**
- * The PHP “caller” mirrors the Go caller. It constructs a typed context,
- * embeds it as an encrypted/signed X-Context header, and exercises both
- * callee stacks (Go and PHP), including both relay chains.
+ * xctx example — PHP Caller
  *
- * Behavior
- *  - Prints raw response bodies for every call.
- *  - For Chain A and B, extracts and prints “prev” and “updated” contexts to
- *    verify both the mutation contract and cross-language interop.
+ * Purpose:
+ *   Demonstrates consuming the published "ariedeha/xctx" package (Composer)
+ *   to embed a typed payload into X-Context and call four callees:
+ *   Go(:8081), PHP(:8082), Node(:8083), Node-Express(:8084).
+ *
+ * Run: (inside example/caller)  composer install && composer run start
  */
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../../vendor/autoload.php';
+require __DIR__ . '/vendor/autoload.php';
 
 use ArieDeha\Xctx\Config;
 use ArieDeha\Xctx\Codec;
 
-/**
- * Construct a Codec with the same parameters as the callees.
- * Replace with env-based wiring in production as appropriate.
- */
-$user = new Config(
+/** @var Config $config Example configuration aligned with other language demos. */
+$config = new Config(
     headerName: 'X-Context',
-    issuer:     'svc-caller',
-    audience:   'svc-callee',
+    issuer: 'svc-caller',
+    audience: 'svc-callee',
     ttlSeconds: 120,
     currentKid: 'kid-demo',
-    currentKey: '0123456789abcdef0123456789abcdef'
+    currentKey: '0123456789abcdef0123456789abcdef',
 );
-$aad = fn() => 'TENANT=blue|ENV=dev';
-$codec = Codec::buildFromEnv($user, $aad);
 
-/** @var array<string,mixed> $payload The typed context in array form. */
-$payload = ['user_id' => 7, 'user_name' => 'arie', 'role' => 'admin'];
-[$name, $value] = $codec->embedHeader($payload);
+/** @var Codec $codec Constructed from config + AAD binder (tenant/env). */
+$codec = Codec::buildFromEnv($config, fn () => 'TENANT=blue|ENV=dev');
 
 /**
- * get_with_header performs an HTTP GET with the X-Context header set and
- * prints the response body to stdout.
+ * Pretty print a log section.
  *
- * @param string $url   Target URL.
- * @param string $name  Header name (e.g., "X-Context").
- * @param string $value Header value (sealed, versioned envelope).
- * @return string Raw response body (empty on transport error).
+ * @param string $title
+ * @param int    $status
+ * @param mixed  $body
+ * @return void
  */
-function get_with_header(string $url, string $name, string $value): string {
+function log_block(string $title, int $status, mixed $body): void
+{
+    echo "\n== {$title} [{$status}] ==\n";
+    if (is_string($body)) {
+        echo $body, "\n";
+    } else {
+        echo json_encode($body, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
+    }
+}
+
+/**
+ * Perform a GET with a sealed header for the given payload.
+ *
+ * @param Codec               $codec
+ * @param string              $url
+ * @param array<string,mixed> $payload
+ * @return array{status:int, body:mixed}
+ */
+function http_get_with_ctx(Codec $codec, string $url, array $payload): array
+{
+    [$name, $value] = $codec->embedHeader($payload);
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [$name . ': ' . $value],
+        CURLOPT_HTTPHEADER     => [$name . ': ' . $value],
+        CURLOPT_HEADER         => false,
     ]);
-    $body = curl_exec($ch) ?: '';
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $respBody = curl_exec($ch);
+    $status   = (int) (curl_getinfo($ch, CURLINFO_RESPONSE_CODE) ?: 0);
     curl_close($ch);
 
-    echo "\n== $url [$code] ==\n$body\n";
-    return $body;
+    $decoded = null;
+    if (is_string($respBody)) {
+        $tmp = json_decode($respBody, true);
+        $decoded = $tmp === null ? $respBody : $tmp;
+    }
+    return ['status' => $status, 'body' => $decoded];
 }
 
-// Simple calls
-get_with_header('http://127.0.0.1:8081/whoami', $name, $value);
-get_with_header('http://127.0.0.1:8082/whoami', $name, $value);
-get_with_header('http://127.0.0.1:8083/whoami', $name, $value);
-get_with_header('http://127.0.0.1:8081/relay/php', $name, $value);
-get_with_header('http://127.0.0.1:8082/relay/go',  $name, $value);
-get_with_header('http://127.0.0.1:8083/relay/go',  $name, $value);
-get_with_header('http://127.0.0.1:8083/relay/php', $name, $value);
+// Initial context (your app would derive this from auth/session/etc.)
+$ctx = ['user_id' => 7, 'user_name' => 'arie', 'role' => 'admin'];
 
-// Chain A: caller → go → php(update) → go(update) → caller
-$bodyA = get_with_header('http://127.0.0.1:8081/relay/php/update', $name, $value);
-$A = json_decode($bodyA, true);
-if (is_array($A) && ($A['server'] ?? '') !== '') {
-    echo "\n[Chain A] prev        = " . json_encode($A['prev_ctx'] ?? []) . "\n";
-    echo "[Chain A] php-updated = " . json_encode($A['php_updated_ctx'] ?? []) . "\n";
-    echo "[Chain A] go-updated  = " . json_encode($A['go_updated_ctx'] ?? []) . "\n";
+// Callee targets
+$GO    = 'http://127.0.0.1:8081';
+$PHP   = 'http://127.0.0.1:8082';
+$NODE  = 'http://127.0.0.1:8083';
+$NODEE = 'http://127.0.0.1:8084';
+
+// whoami / update on all four callees
+foreach ([['go',$GO], ['php',$PHP], ['node',$NODE], ['node-express',$NODEE]] as [$name, $base]) {
+    $r = http_get_with_ctx($codec, "{$base}/whoami", $ctx);
+    log_block("{$name} /whoami", $r['status'], $r['body']);
+
+    $r = http_get_with_ctx($codec, "{$base}/update", $ctx);
+    log_block("{$name} /update", $r['status'], $r['body']);
 }
 
-// Chain B: caller → php → go(update) → php → caller
-$bodyB = get_with_header('http://127.0.0.1:8082/relay/go/update', $name, $value);
-$B = json_decode($bodyB, true);
-if (is_array($B) && ($B['server'] ?? '') !== '') {
-    echo "\n[Chain B] prev    = " . json_encode($B['prev_ctx'] ?? []) . "\n";
-    echo "[Chain B] updated = " . json_encode($B['updated_ctx'] ?? []) . "\n";
-}
-
-// Chain D: caller → php → node(update) → php(update) → caller
-$bodyD = get_with_header('http://127.0.0.1:8082/relay/node/update', $name, $value);
-$D = json_decode($bodyD, true);
-if (is_array($D) && ($D['server'] ?? '') !== '') {
-    echo "\n[Chain D] prev        = " . json_encode($D['prev_ctx'] ?? []) . "\n";
-    echo "[Chain D] node-updated = " . json_encode($D['node_updated_ctx'] ?? []) . "\n";
-    echo "[Chain D] php-updated  = " . json_encode($D['php_updated_ctx'] ?? []) . "\n";
+// Chains via Node(:8083) including relays to Node-Express(:8084)
+foreach ([
+             ['node → go /whoami', "{$NODE}/relay/go"],
+             ['node → go /update', "{$NODE}/relay/go/update"],
+             ['node → php /whoami', "{$NODE}/relay/php"],
+             ['node → php /update', "{$NODE}/relay/php/update"],
+             ['node → node-express /whoami', "{$NODE}/relay/node-express"],
+             ['node → node-express /update', "{$NODE}/relay/node-express/update"],
+         ] as [$title, $url]) {
+    $r = http_get_with_ctx($codec, $url, $ctx);
+    log_block($title, $r['status'], $r['body']);
 }

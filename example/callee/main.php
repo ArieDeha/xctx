@@ -1,346 +1,205 @@
 <?php
-// SPDX-License-Identifier: Apache-2.0
-
 /**
- * file: ./example/callee/main.php
+ * xctx example — PHP Callee (port 8082)
  *
- * PHP “callee” for the xctx demonstration. This service accepts requests that
- * carry an encrypted/signed `X-Context` header, verifies & decodes the typed
- * payload, optionally mutates it, and replies in JSON. It also supports relays
- * to the Go and Node callees for cross-language verification and chaining.
+ * Purpose:
+ *   Demonstrate consuming the published "ariedeha/xctx" package (Composer)
+ *   as a 3rd-party dependency. This callee:
+ *     - reads & verifies the X-Context header,
+ *     - optionally mutates the context (+php / |php),
+ *     - relays to Go(:8081), Node(:8083), Node-Express(:8084) by re-sealing the context.
  *
- * ──────────────────────────────────────────────────────────────────────────────
- * Ports & Endpoints
- * ──────────────────────────────────────────────────────────────────────────────
- *  - :8082/whoami
- *      Parse X-Context and return {"server":"php-callee","ctx":{...},"claims":{...}}.
- *
- *  - :8082/update
- *      Parse X-Context, mutate it (add “+php” to user_name, “|php” to role), and
- *      return {"server":"php-callee","prev_ctx":{...},"updated_ctx":{...}}.
- *
- *  - :8082/relay/go
- *      Parse X-Context, re-embed it, call Go callee /whoami, and stream response.
- *
- *  - :8082/relay/go/update       (Chain B in examples)
- *      Parse original X-Context, re-embed to Go /update (Go mutates), then return
- *      {"server":"php-callee","prev_ctx":{...},"updated_ctx":{...}} with Go’s
- *      updated payload echoed back to the caller.
- *
- *  - :8082/relay/node
- *      Parse X-Context, re-embed it, call Node callee /whoami, and stream response.
- *
- *  - :8082/relay/node/update     (Chain D in examples)
- *      Parse original X-Context, re-embed to Node /update (Node mutates), then
- *      apply PHP’s own update and return
- *      {"server":"php-callee","prev_ctx":{...},"node_updated_ctx":{...},
- *       "php_updated_ctx":{...}} so caller can compare both steps.
- *
- * ──────────────────────────────────────────────────────────────────────────────
- * Run with PHP’s built-in server (from repo root):
- *     php -S 127.0.0.1:8082 example/callee/main.php
- *
- * Pre-conditions:
- *  - `composer install` has been run (autoload available).
- *  - Go callee listening on :8081 if you use /relay/go* routes.
- *  - Node callee listening on :8083 if you use /relay/node* routes.
+ * Endpoints:
+ *   GET /whoami
+ *   GET /update
+ *   GET /relay/go
+ *   GET /relay/go/update
+ *   GET /relay/node
+ *   GET /relay/node/update
+ *   GET /relay/node-express
+ *   GET /relay/node-express/update
  */
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../../vendor/autoload.php';
-
 use ArieDeha\Xctx\Config;
 use ArieDeha\Xctx\Codec;
-use ArieDeha\Xctx\Exception\ValidationException;
-use ArieDeha\Xctx\Exception\CryptoException;
+
+// -------------------- Configuration (demo defaults; use env/secret store in real apps) --------------------
+
+/** @var string HEADER_NAME The single HTTP header name used to carry the sealed envelope. */
+const HEADER_NAME = 'X-Context';
+
+/** @var Config $config Runtime configuration mirrored across languages for wire compatibility. */
+$config = new Config(
+    headerName: HEADER_NAME,
+    issuer: 'svc-caller',
+    audience: 'svc-callee',
+    ttlSeconds: 120,
+    currentKid: 'kid-demo',
+    currentKey: '0123456789abcdef0123456789abcdef', // 32-byte demo key — DO NOT hardcode in production
+);
+
+/** @var Codec $codec The PHP codec constructed from config + AAD binder. */
+$codec = Codec::buildFromEnv($config, fn () => 'TENANT=blue|ENV=dev');
+
+// -------------------- Utilities --------------------
 
 /**
- * Typed payload carried between services.
+ * Send a JSON response with a given HTTP status.
  *
- * @psalm-type PassingContext = array{
- *   user_id: int,
- *   user_name: string,
- *   role?: string
- * }
+ * @param int   $status HTTP status code
+ * @param mixed $body   Any value encodable to JSON
+ * @return void
  */
-
-/** **************************************************************************
- * Utilities
- * **************************************************************************/
-
-/**
- * Sends a JSON response and terminates.
- *
- * @param int   $status  HTTP status code.
- * @param array $payload JSON-encodable payload.
- * @return never
- */
-function json_out(int $status, array $payload): never
+function send_json(int $status, mixed $body): void
 {
     http_response_code($status);
     header('Content-Type: application/json');
-    echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    exit;
+    echo json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }
 
 /**
- * Simple stderr log of the context for visibility during the demo.
+ * Read a header value from the PHP built-in server environment, case-insensitive.
  *
- * @param string $label
- * @param mixed  $ctx
- * @return void
+ * @param string $name Logical header name, e.g., "X-Context"
+ * @return string|null The header value if present, otherwise null
  */
-function log_ctx(string $label, mixed $ctx): void
+function read_header(string $name): ?string
 {
-    error_log(sprintf('[%s] %s', $label, json_encode($ctx, JSON_UNESCAPED_SLASHES)));
-}
-
-/**
- * Reads the X-Context header value (case-insensitive).
- *
- * @param string $headerName
- * @return string|null
- */
-function read_xctx_header(string $headerName = 'X-Context'): ?string
-{
-    // Built-in server maps headers to $_SERVER as HTTP_<NAME>
-    $key = 'HTTP_' . strtoupper(str_replace('-', '_', $headerName));
+    $key = 'HTTP_' . str_replace('-', '_', strtoupper($name));
     return $_SERVER[$key] ?? null;
 }
 
 /**
- * HTTP GET helper with custom headers.
+ * Apply a business-level mutation for /update on the PHP callee.
+ * Adds "+php" to user_name and "|php" to role.
  *
- * @param string       $url
- * @param array<string,string> $headers
- * @return array{status:int, body:string}
- */
-function http_get(string $url, array $headers = []): array
-{
-    $curl = curl_init($url);
-    $hdrs = [];
-    foreach ($headers as $k => $v) {
-        $hdrs[] = $k . ': ' . $v;
-    }
-    curl_setopt_array($curl, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_HTTPHEADER     => $hdrs,
-    ]);
-    $body = curl_exec($curl);
-    $code = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-    if ($body === false) {
-        $err = curl_error($curl);
-        curl_close($curl);
-        return ['status' => 502, 'body' => json_encode(['error' => 'curl: ' . $err])];
-    }
-    curl_close($curl);
-    return ['status' => $code, 'body' => (string)$body];
-}
-
-/**
- * Returns the demo codec using the same config/key as the Go/Node examples.
- *
- * @return Codec
- */
-function build_codec(): Codec
-{
-    $user = new Config(
-        headerName: 'X-Context',
-        issuer:     'svc-caller',
-        audience:   'svc-callee',
-        ttlSeconds: 120,
-        currentKid: 'kid-demo',
-        currentKey: '0123456789abcdef0123456789abcdef', // 32 bytes
-    );
-    $aad = fn (): string => 'TENANT=blue|ENV=dev';
-    return Codec::buildFromEnv($user, $aad);
-}
-
-/**
- * PHP mutation used by /update (adds +php and |php).
- *
- * @param array $inCtx @psalm-param PassingContext $inCtx
- * @return array       @psalm-return PassingContext
+ * @param array<string,mixed> $inCtx
+ * @return array<string,mixed>
  */
 function php_update(array $inCtx): array
 {
     $out = $inCtx;
-    $out['user_name'] = ($out['user_name'] ?? '') !== '' ? $out['user_name'] . '+php' : 'php';
-    $out['role']      = ($out['role']      ?? '') !== '' ? $out['role']      . '|php' : 'php';
+    $out['user_name'] = isset($out['user_name']) && $out['user_name'] !== ''
+        ? ($out['user_name'] . '+php')
+        : 'php';
+    $out['role'] = isset($out['role']) && $out['role'] !== ''
+        ? ($out['role'] . '|php')
+        : 'php';
     return $out;
 }
 
-/** **************************************************************************
- * Router
- * **************************************************************************/
-
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-$path   = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-
-// Only GET is used in the demo flows; reject others early.
-if ($method !== 'GET') {
-    json_out(405, ['server' => 'php-callee', 'error' => 'method not allowed']);
+/**
+ * Relay helper: re-embed payload and proxy the response from a target URL.
+ *
+ * @param Codec               $codec
+ * @param array<string,mixed> $payload
+ * @param string              $url
+ * @return void
+ */
+function relay(Codec $codec, array $payload, string $url): void
+{
+    [$name, $value] = $codec->embedHeader($payload);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER     => [$name . ': ' . $value],
+        CURLOPT_HEADER         => false,
+    ]);
+    $respBody = curl_exec($ch);
+    $status   = curl_getinfo($ch, CURLINFO_RESPONSE_CODE) ?: 500;
+    if ($respBody === false) {
+        send_json(502, ['server' => 'php-callee', 'error' => 'proxy failure']);
+        return;
+    }
+    http_response_code((int)$status);
+    header('Content-Type: application/json');
+    echo $respBody;
 }
 
-$codec = build_codec();
+// -------------------- Routing --------------------
+
+$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+if ($method !== 'GET') {
+    send_json(405, ['server' => 'php-callee', 'error' => 'method not allowed']);
+    exit;
+}
 
 switch ($path) {
     case '/whoami': {
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            // Parse the header value to obtain typed payload + claims.
-            /** @var array{payload: array, claims: array} $parsed */
-            $parsed = $codec->parseHeaderValue($val);
-            log_ctx('php:/whoami', $parsed['payload']);
-            json_out(200, [
-                'server' => 'php-callee',
-                'ctx'    => $parsed['payload'],
-                'claims' => $parsed['claims'],
-            ]);
-        } catch (CryptoException|ValidationException $e) {
-            json_out(401, ['server' => 'php-callee', 'error' => 'parse failed: ' . $e->getMessage()]);
+        $val = read_header(HEADER_NAME);
+        if ($val === null || $val === '') {
+            send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]);
+            break;
         }
+        [$payload, $claims] = $codec->parseHeaderValue($val);
+        send_json(200, ['server' => 'php-callee', 'ctx' => $payload, 'claims' => $claims]);
+        break;
     }
 
     case '/update': {
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            /** @var array{payload: array, claims: array} $parsed */
-            $parsed = $codec->parseHeaderValue($val);
-            $prev   = $parsed['payload'];
-            log_ctx('php:/update prev', $prev);
-            $updated = php_update($prev);
-            json_out(200, [
-                'server'     => 'php-callee',
-                'prev_ctx'   => $prev,
-                'updated_ctx'=> $updated,
-            ]);
-        } catch (CryptoException|ValidationException $e) {
-            json_out(401, ['server' => 'php-callee', 'error' => 'parse failed: ' . $e->getMessage()]);
+        $val = read_header(HEADER_NAME);
+        if ($val === null || $val === '') {
+            send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]);
+            break;
         }
+        [$payload] = $codec->parseHeaderValue($val);
+        $updated = php_update($payload);
+        send_json(200, ['server' => 'php-callee', 'prev_ctx' => $payload, 'updated_ctx' => $updated]);
+        break;
     }
+
+    // -------- Relays --------
 
     case '/relay/go': {
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            $parsed = $codec->parseHeaderValue($val);
-            log_ctx('php:/relay/go', $parsed['payload']);
-            // Re-embed to normalize/enforce claims/AAD for the hop.
-            [$name, $sealed] = $codec->embedHeader($parsed['payload']);
-            $r = http_get('http://127.0.0.1:8081/whoami', [$name => $sealed]);
-            http_response_code($r['status']);
-            header('Content-Type: application/json');
-            echo $r['body'];
-            exit;
-        } catch (CryptoException|ValidationException $e) {
-            json_out(401, ['server' => 'php-callee', 'error' => 'parse/relay failed: ' . $e->getMessage()]);
-        }
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8081/whoami');
+        break;
     }
-
     case '/relay/go/update': {
-        // Chain B: caller → php → go(update) → php → caller
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            $parsed = $codec->parseHeaderValue($val);
-            $original = $parsed['payload'];
-            log_ctx('php:/relay/go/update original', $original);
-
-            [$name, $sealed] = $codec->embedHeader($original);
-            $r = http_get('http://127.0.0.1:8081/update', [$name => $sealed]);
-            if ($r['status'] !== 200) {
-                json_out(502, ['server' => 'php-callee', 'error' => 'forward to go failed', 'code' => $r['status']]);
-            }
-
-            /** @var array<string,mixed> $goOut */
-            $goOut = json_decode($r['body'], true) ?: [];
-            if (($goOut['server'] ?? '') === '') {
-                json_out(502, ['server' => 'php-callee', 'error' => 'go returned bad json']);
-            }
-
-            // Echo what Go produced as "updated".
-            json_out(200, [
-                'server'      => 'php-callee',
-                'prev_ctx'    => $original,
-                'updated_ctx' => $goOut['updated_ctx'] ?? null,
-            ]);
-        } catch (\Throwable $e) {
-            json_out(502, ['server' => 'php-callee', 'error' => 'chain go/update failed: ' . $e->getMessage()]);
-        }
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8081/update');
+        break;
     }
 
     case '/relay/node': {
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            $parsed = $codec->parseHeaderValue($val);
-            log_ctx('php:/relay/node', $parsed['payload']);
-
-            [$name, $sealed] = $codec->embedHeader($parsed['payload']);
-            $r = http_get('http://127.0.0.1:8083/whoami', [$name => $sealed]);
-            http_response_code($r['status']);
-            header('Content-Type: application/json');
-            echo $r['body'];
-            exit;
-        } catch (CryptoException|ValidationException $e) {
-            json_out(401, ['server' => 'php-callee', 'error' => 'parse/relay failed: ' . $e->getMessage()]);
-        }
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8083/whoami');
+        break;
     }
-
     case '/relay/node/update': {
-        // Chain D: caller → php → node(update) → php(update) → caller
-        try {
-            $val = read_xctx_header($codec->getHeaderName());
-            if ($val === null || $val === '') {
-                json_out(400, ['server' => 'php-callee', 'error' => 'missing X-Context']);
-            }
-            $parsed   = $codec->parseHeaderValue($val);
-            $original = $parsed['payload'];
-            log_ctx('php:/relay/node/update original', $original);
-
-            [$name, $sealed] = $codec->embedHeader($original);
-            $r = http_get('http://127.0.0.1:8083/update', [$name => $sealed]);
-            if ($r['status'] !== 200) {
-                json_out(502, ['server' => 'php-callee', 'error' => 'node update failed', 'code' => $r['status']]);
-            }
-
-            /** @var array<string,mixed> $nodeOut */
-            $nodeOut = json_decode($r['body'], true) ?: [];
-            if (($nodeOut['server'] ?? '') === '') {
-                json_out(502, ['server' => 'php-callee', 'error' => 'bad json from node']);
-            }
-
-            $nodeUpdated = $nodeOut['updated_ctx'] ?? null;
-            log_ctx('php:/relay/node/update node-updated', $nodeUpdated);
-
-            $phpUpdated = is_array($nodeUpdated) ? php_update($nodeUpdated) : null;
-
-            json_out(200, [
-                'server'           => 'php-callee',
-                'prev_ctx'         => $original,
-                'node_updated_ctx' => $nodeUpdated,
-                'php_updated_ctx'  => $phpUpdated,
-            ]);
-        } catch (\Throwable $e) {
-            json_out(502, ['server' => 'php-callee', 'error' => 'chain node/update failed: ' . $e->getMessage()]);
-        }
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8083/update');
+        break;
     }
 
-    default:
-        json_out(404, ['server' => 'php-callee', 'error' => 'not found', 'path' => $path]);
+    case '/relay/node-express': {
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8084/whoami');
+        break;
+    }
+    case '/relay/node-express/update': {
+        $val = read_header(HEADER_NAME);
+        if (!$val) { send_json(400, ['server' => 'php-callee', 'error' => 'missing ' . HEADER_NAME]); break; }
+        [$payload] = $codec->parseHeaderValue($val);
+        relay($codec, $payload, 'http://127.0.0.1:8084/update');
+        break;
+    }
+
+    default: {
+        send_json(404, ['server' => 'php-callee', 'error' => 'not found', 'path' => $path]);
+    }
 }
