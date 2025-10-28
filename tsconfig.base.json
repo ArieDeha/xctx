@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
+
+    // Keep isolated transforms safe; ok for both targets.
+    "isolatedModules": true,
+
+    // Helpful QoL:
+    "resolveJsonModule": true,
+    "esModuleInterop": false,
+
+    // Make TS treat files as modules by default.
+    "moduleDetection": "force"
+  }
+}

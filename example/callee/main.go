@@ -270,6 +270,98 @@ func relayPHPUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// relayNodeWhoamiHandler forwards to Node's /whoami using the same header.
+func relayNodeWhoamiHandler(w http.ResponseWriter, r *http.Request) {
+	_, ctxData, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
+	}
+	logCtx("go:/relay/node", ctxData)
+
+	name, val, err := embedTyped(ctxData)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("re-embed failed: %v", err),
+		})
+		return
+	}
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://127.0.0.1:8083/whoami", nil)
+	req.Header.Set(name, val)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("forward to node failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// relayNodeUpdateHandler: caller → go → node(update) → go(update) → caller
+func relayNodeUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	_, original, err := codec.ParseCtx(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("parse failed: %v", err),
+		})
+		return
+	}
+	logCtx("go:/relay/node/update original", original)
+
+	name, val, err := embedTyped(original)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("re-embed failed: %v", err),
+		})
+		return
+	}
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://127.0.0.1:8083/update", nil)
+	req.Header.Set(name, val)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  fmt.Sprintf("forward to node failed: %v", err),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	var nodeOut struct {
+		Server  string         `json:"server"`
+		Prev    PassingContext `json:"prev_ctx"`
+		Updated PassingContext `json:"updated_ctx"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nodeOut); err != nil || nodeOut.Server == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"server": "go-callee",
+			"error":  "node returned bad json",
+		})
+		return
+	}
+	logCtx("go:/relay/node/update node-updated", nodeOut.Updated)
+
+	goUpdated := goUpdate(nodeOut.Updated)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server":           "go-callee",
+		"prev_ctx":         original,
+		"node_updated_ctx": nodeOut.Updated,
+		"go_updated_ctx":   goUpdated,
+	})
+}
+
 func main() {
 	// Build codec (env + overrides) and get the process-unique TypedKey[T].
 	// These helpers are defined in xctx_config.go, and they wire defaults,
@@ -297,6 +389,9 @@ func main() {
 	mux.HandleFunc("/update", updateHandler)
 	mux.HandleFunc("/relay/php", relayPHPWhoamiHandler)
 	mux.HandleFunc("/relay/php/update", relayPHPUpdateHandler)
+	// New: simple relay and chain with Node callee
+	mux.HandleFunc("/relay/node", relayNodeWhoamiHandler)
+	mux.HandleFunc("/relay/node/update", relayNodeUpdateHandler)
 
 	srv := &http.Server{
 		Addr:              ":8081",

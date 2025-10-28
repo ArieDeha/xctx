@@ -320,8 +320,10 @@ final class Codec
             'exp' => $exp,
             'jti' => $pl['jti'] ?? '',
         ];
-
-        return [$ctx, $claims];
+        return array(
+            'payload' => $ctx,
+            'claims' => $claims
+        );
     }
 
     /**
@@ -390,4 +392,15 @@ final class Codec
         $a = strtoupper($alg);
         $a = str_replace([' ', '-', '_'], '', $a); // e.g. AES-256-GCM -> AES256GCM
         return $a;
-    }}
+    }
+
+    /**
+     * Returns the configured header name used to carry the sealed envelope.
+     * Example: "X-Context". This accessor is used by examples to read/write
+     * the correct header consistently across languages.
+     */
+    public function getHeaderName(): string
+    {
+        return $this->cfg->headerName;
+    }
+}

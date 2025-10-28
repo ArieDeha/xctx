@@ -80,8 +80,11 @@ function get_with_header(string $url, string $name, string $value): string {
 // Simple calls
 get_with_header('http://127.0.0.1:8081/whoami', $name, $value);
 get_with_header('http://127.0.0.1:8082/whoami', $name, $value);
+get_with_header('http://127.0.0.1:8083/whoami', $name, $value);
 get_with_header('http://127.0.0.1:8081/relay/php', $name, $value);
 get_with_header('http://127.0.0.1:8082/relay/go',  $name, $value);
+get_with_header('http://127.0.0.1:8083/relay/go',  $name, $value);
+get_with_header('http://127.0.0.1:8083/relay/php', $name, $value);
 
 // Chain A: caller → go → php(update) → go(update) → caller
 $bodyA = get_with_header('http://127.0.0.1:8081/relay/php/update', $name, $value);
@@ -98,4 +101,13 @@ $B = json_decode($bodyB, true);
 if (is_array($B) && ($B['server'] ?? '') !== '') {
     echo "\n[Chain B] prev    = " . json_encode($B['prev_ctx'] ?? []) . "\n";
     echo "[Chain B] updated = " . json_encode($B['updated_ctx'] ?? []) . "\n";
+}
+
+// Chain D: caller → php → node(update) → php(update) → caller
+$bodyD = get_with_header('http://127.0.0.1:8082/relay/node/update', $name, $value);
+$D = json_decode($bodyD, true);
+if (is_array($D) && ($D['server'] ?? '') !== '') {
+    echo "\n[Chain D] prev        = " . json_encode($D['prev_ctx'] ?? []) . "\n";
+    echo "[Chain D] node-updated = " . json_encode($D['node_updated_ctx'] ?? []) . "\n";
+    echo "[Chain D] php-updated  = " . json_encode($D['php_updated_ctx'] ?? []) . "\n";
 }

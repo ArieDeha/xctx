@@ -163,3 +163,9 @@ fabric.properties
 .phpunit.cache
 /coverage
 /coverage-node
+/node_modules
+/dist
+**/*.zip
+
+# Added because this is intended to be used as a library / package
+composer.lock

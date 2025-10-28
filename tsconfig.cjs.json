@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "target": "ES2019",
+
+    // Flatten
+    "rootDir": "src/nodejs",
+    "outDir": "dist/nodejs/cjs",
+
+    // Do NOT re-emit .d.ts (ESM already did)
+    "declaration": false,
+
+    // Crucial: allow downleveling import/export to require/exports
+    "verbatimModuleSyntax": false,
+
+    "sourceMap": false
+  },
+  "include": ["src/nodejs/**/*"]
+}

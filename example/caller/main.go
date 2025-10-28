@@ -122,8 +122,11 @@ func main() {
 	// 3) Basic calls + simple relays
 	_ = call("http://127.0.0.1:8081/whoami")    // Go callee
 	_ = call("http://127.0.0.1:8082/whoami")    // PHP callee
+	_ = call("http://127.0.0.1:8083/whoami")    // Node callee
 	_ = call("http://127.0.0.1:8081/relay/php") // Go → PHP relay
 	_ = call("http://127.0.0.1:8082/relay/go")  // PHP → Go relay
+	_ = call("http://127.0.0.1:8083/relay/go")  // Node → Go relay
+	_ = call("http://127.0.0.1:8083/relay/php") // Node → PHP relay
 
 	// 4) Chain A: caller → go → php(update) → go(update) → caller
 	{
@@ -147,4 +150,21 @@ func main() {
 			fmt.Printf("[Chain B] updated = %+v\n", out.Updated)
 		}
 	}
+	// 6) Chain C: caller → go → node(update) → go(update) → caller
+	{
+		body := call("http://127.0.0.1:8081/relay/node/update")
+		var out struct {
+			Server      string         `json:"server"`
+			Prev        PassingContext `json:"prev_ctx"`
+			NodeUpdated PassingContext `json:"node_updated_ctx"`
+			GoUpdated   PassingContext `json:"go_updated_ctx"`
+		}
+		_ = json.Unmarshal([]byte(body), &out)
+		if out.Server != "" {
+			fmt.Printf("\n[Chain C] prev        = %+v\n", out.Prev)
+			fmt.Printf("[Chain C] node-updated = %+v\n", out.NodeUpdated)
+			fmt.Printf("[Chain C] go-updated   = %+v\n", out.GoUpdated)
+		}
+	}
+
 }

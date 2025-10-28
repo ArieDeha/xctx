@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    // ESM under Node semantics
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2020",
+
+    // Flatten
+    "rootDir": "src/nodejs",
+    "outDir": "dist/nodejs/esm",
+
+    // Emit declarations once from the ESM build
+    "declaration": true,
+    "declarationDir": "dist/nodejs",
+
+    // Keep ESM imports verbatim (needed for proper .js paths)
+    "verbatimModuleSyntax": true,
+
+    "sourceMap": false
+  },
+  "include": ["src/nodejs/**/*"]
+}
