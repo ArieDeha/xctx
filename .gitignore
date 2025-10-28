@@ -163,7 +163,7 @@ fabric.properties
 .phpunit.cache
 /coverage
 /coverage-node
-/node_modules
+**/node_modules
 /dist
 **/*.zip
 
